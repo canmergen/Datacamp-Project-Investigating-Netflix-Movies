@@ -1,10 +1,11 @@
-def shap_rfecv(X, y, model_type="LGBM", min_features_to_select=5, step=1, cv=5, scoring="roc_auc", sample_size=None):
+def shap_rfecv_detailed(X, y, model_type="LGBM", min_features_to_select=5, step=1, cv=5, scoring="roc_auc", sample_size=None):
     import shap
     import numpy as np
     import pandas as pd
     import matplotlib.pyplot as plt
-    from sklearn.model_selection import cross_val_score, StratifiedKFold, train_test_split
+    from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
     from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import roc_auc_score
 
     model = get_model_by_type(model_type)
     X = X.copy()
@@ -25,52 +26,60 @@ def shap_rfecv(X, y, model_type="LGBM", min_features_to_select=5, step=1, cv=5, 
         iteration += 1
         model.fit(X_scaled[current_features], y)
 
+        # SHAP hesapla
         try:
             if model_type.upper() in ["RF", "XGB", "LGBM"]:
                 explainer = shap.TreeExplainer(model)
+                shap_values = explainer.shap_values(X_scaled[current_features])
+                if isinstance(shap_values, list):
+                    shap_values = shap_values[1]
             else:
-                explainer = shap.LinearExplainer(model, X_scaled[current_features], feature_dependence="independent")
-            shap_values = explainer.shap_values(X_scaled[current_features])
-            if isinstance(shap_values, list):  # TreeExplainer returns list for classification
-                shap_values = shap_values[1]
+                explainer = shap.LinearExplainer(model, X_scaled[current_features])
+                shap_values = explainer.shap_values(X_scaled[current_features])
         except Exception as e:
-            print(f"SHAP hesaplanamadı: {e}")
+            print(f"[{iteration}] SHAP hesaplaması başarısız: {e}")
             break
 
-        shap_df = pd.DataFrame(shap_values, columns=current_features)
-        mean_abs_shap = shap_df.abs().mean().sort_values()
-        to_remove = mean_abs_shap.index[:step].tolist()
+        # SHAP değerleri üzerinden önem sıralaması
+        shap_df = pd.DataFrame(np.abs(shap_values), columns=current_features)
+        mean_shap = shap_df.mean().sort_values()
+        to_remove = mean_shap.index[:step].tolist()
 
-        cv_score = cross_val_score(model, X_scaled[current_features], y, cv=StratifiedKFold(n_splits=cv), scoring=scoring)
+        # AUC hesapla
+        cv_scores = cross_val_score(model, X_scaled[current_features], y, 
+                                    cv=StratifiedKFold(n_splits=cv, shuffle=True, random_state=42),
+                                    scoring=scoring)
         results.append({
             "iteration": iteration,
             "n_features": len(current_features),
-            "mean_auc": np.mean(cv_score),
-            "std_auc": np.std(cv_score),
-            "features": current_features.copy(),
-            "removed": to_remove
+            "mean_auc": round(np.mean(cv_scores), 5),
+            "std_auc": round(np.std(cv_scores), 5),
+            "selected_features": current_features.copy(),
+            "removed_features": to_remove
         })
 
+        # Feature azalt
         current_features = [f for f in current_features if f not in to_remove]
 
     results_df = pd.DataFrame(results)
     best_row = results_df.loc[results_df["mean_auc"].idxmax()]
-    best_features = best_row["features"]
+    best_features = best_row["selected_features"]
 
-    # Final evaluation
+    # Final AUC değerlendirmesi
     X_train, X_test, y_train, y_test = train_test_split(X[best_features], y, test_size=0.2, random_state=42, stratify=y)
     model = get_model_by_type(model_type)
     model.fit(X_train, y_train)
     train_auc = roc_auc_score(y_train, model.predict_proba(X_train)[:, 1])
     test_auc = roc_auc_score(y_test, model.predict_proba(X_test)[:, 1])
 
-    # Plotting
+    # Grafik çiz
     plt.figure(figsize=(8, 5))
     plt.plot(results_df["n_features"], results_df["mean_auc"], marker="o", label="CV AUC")
     plt.fill_between(results_df["n_features"],
                      results_df["mean_auc"] - results_df["std_auc"],
                      results_df["mean_auc"] + results_df["std_auc"],
                      alpha=0.2, label="±1 STD")
+    plt.axvline(len(best_features), linestyle="--", color="red", label=f"Best: {len(best_features)}")
     plt.xlabel("Number of Features")
     plt.ylabel("Mean ROC AUC")
     plt.title(f"SHAP-RFECV Performance ({model_type})")
