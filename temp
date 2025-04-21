@@ -1,0 +1,87 @@
+def shap_rfecv(X, y, model_type="LGBM", min_features_to_select=5, step=1, cv=5, scoring="roc_auc", sample_size=None):
+    import shap
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from sklearn.model_selection import cross_val_score, StratifiedKFold, train_test_split
+    from sklearn.preprocessing import StandardScaler
+
+    model = get_model_by_type(model_type)
+    X = X.copy()
+    y = y.copy()
+
+    if sample_size is not None and sample_size < len(X):
+        X = X.sample(n=sample_size, random_state=42)
+        y = y.loc[X.index]
+
+    scaler = StandardScaler()
+    X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=X.columns, index=X.index)
+
+    current_features = list(X_scaled.columns)
+    results = []
+    iteration = 0
+
+    while len(current_features) > min_features_to_select:
+        iteration += 1
+        model.fit(X_scaled[current_features], y)
+
+        try:
+            if model_type.upper() in ["RF", "XGB", "LGBM"]:
+                explainer = shap.TreeExplainer(model)
+            else:
+                explainer = shap.LinearExplainer(model, X_scaled[current_features], feature_dependence="independent")
+            shap_values = explainer.shap_values(X_scaled[current_features])
+            if isinstance(shap_values, list):  # TreeExplainer returns list for classification
+                shap_values = shap_values[1]
+        except Exception as e:
+            print(f"SHAP hesaplanamadı: {e}")
+            break
+
+        shap_df = pd.DataFrame(shap_values, columns=current_features)
+        mean_abs_shap = shap_df.abs().mean().sort_values()
+        to_remove = mean_abs_shap.index[:step].tolist()
+
+        cv_score = cross_val_score(model, X_scaled[current_features], y, cv=StratifiedKFold(n_splits=cv), scoring=scoring)
+        results.append({
+            "iteration": iteration,
+            "n_features": len(current_features),
+            "mean_auc": np.mean(cv_score),
+            "std_auc": np.std(cv_score),
+            "features": current_features.copy(),
+            "removed": to_remove
+        })
+
+        current_features = [f for f in current_features if f not in to_remove]
+
+    results_df = pd.DataFrame(results)
+    best_row = results_df.loc[results_df["mean_auc"].idxmax()]
+    best_features = best_row["features"]
+
+    # Final evaluation
+    X_train, X_test, y_train, y_test = train_test_split(X[best_features], y, test_size=0.2, random_state=42, stratify=y)
+    model = get_model_by_type(model_type)
+    model.fit(X_train, y_train)
+    train_auc = roc_auc_score(y_train, model.predict_proba(X_train)[:, 1])
+    test_auc = roc_auc_score(y_test, model.predict_proba(X_test)[:, 1])
+
+    # Plotting
+    plt.figure(figsize=(8, 5))
+    plt.plot(results_df["n_features"], results_df["mean_auc"], marker="o", label="CV AUC")
+    plt.fill_between(results_df["n_features"],
+                     results_df["mean_auc"] - results_df["std_auc"],
+                     results_df["mean_auc"] + results_df["std_auc"],
+                     alpha=0.2, label="±1 STD")
+    plt.xlabel("Number of Features")
+    plt.ylabel("Mean ROC AUC")
+    plt.title(f"SHAP-RFECV Performance ({model_type})")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    return {
+        "results_df": results_df,
+        "best_features": best_features,
+        "train_auc": train_auc,
+        "test_auc": test_auc
+    }
