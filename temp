@@ -1,0 +1,66 @@
+def auto_mutual_information_selection_v2(X, y, model_type="LGBM", topn_range=None,
+                                         scale_value=False, use_class_weight=True,
+                                         cv=5, verbose=True):
+    """
+    Automatically selects the optimal number of top features based on mutual information and evaluates AUC
+    using the external evaluate_auc() function (no modification needed in it).
+    """
+    from sklearn.feature_selection import mutual_info_classif
+    import pandas as pd
+    import numpy as np
+
+    if verbose:
+        print("Running Auto Mutual Information Selection with AUC-based optimization...")
+
+    # MI skorları hesapla
+    mi_scores = mutual_info_classif(X, y, random_state=42)
+    mi_df = pd.DataFrame({
+        "feature": X.columns,
+        "mi_score": mi_scores
+    }).sort_values(by="mi_score", ascending=False).reset_index(drop=True)
+
+    # topn_range yoksa otomatik oluştur
+    if topn_range is None:
+        topn_range = list(range(5, min(60, X.shape[1]), 5))
+
+    best_score = -np.inf
+    best_topn = None
+    best_features = None
+    results = []
+
+    for topn in topn_range:
+        selected_features = mi_df["feature"].iloc[:topn].tolist()
+        X_selected = X[selected_features]
+
+        try:
+            auc_results = evaluate_auc(X_selected, y,
+                                       step_name=f"MI Top{topn}",
+                                       model_type=model_type,
+                                       scale_value=scale_value,
+                                       use_class_weight=use_class_weight,
+                                       cv=cv,
+                                       print_result=False)
+
+            mean_auc = auc_results["cv_mean_auc"]
+            results.append((topn, mean_auc))
+
+            if verbose:
+                print(f"Top {topn} features → CV AUC: {mean_auc:.4f}")
+
+            if mean_auc > best_score:
+                best_score = mean_auc
+                best_topn = topn
+                best_features = selected_features
+
+        except Exception as e:
+            if verbose:
+                print(f"Top {topn} features → Error: {e}")
+            continue
+
+    # Sonuç tablosu
+    results_df = pd.DataFrame(results, columns=["top_n", "cv_mean_auc"])
+
+    if verbose and best_topn:
+        print(f"\nBest top_n: {best_topn} → CV AUC: {best_score:.4f}")
+
+    return best_features, mi_df, results_df
